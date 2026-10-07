@@ -26,6 +26,14 @@ public:
     ~CustomWakeWord();
 
     bool Initialize(AudioCodec* codec, srmodel_list_t* models_list);
+
+    // 把唤醒词换成「你好<名字>」。
+    // name 为用户给设备起的中文名字（如「小爱」），识别成功后作为文本上报给服务器；
+    // name_pinyin 为该名字的汉语拼音（如 "xiao ai"），不带声调，大小写和多余空格都能容忍，
+    // 开头的「你好」加不加都行，这里会统一补上。成功后写进 NVS，下次开机自动沿用；
+    // 拼音解析不了时返回 false，并保持原来的唤醒词不变。
+    bool SetWakeCommand(const std::string& name, const std::string& name_pinyin);
+
     void Feed(const std::vector<int16_t>& data);
     void FeedMono(const int16_t* data, size_t samples);
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
@@ -71,6 +79,12 @@ private:
 
     void FeedSamples(const int16_t* data, size_t samples, bool mono);
     void ParseWakenetModelConfig();
+    // 把 commands_ 提交给 MultiNet，返回是否全部解析成功（内部加锁）
+    bool SubmitCommands();
+    // SubmitCommands 的实现，调用者必须已持有 input_buffer_mutex_
+    bool SubmitCommandsLocked();
+    // 用 NVS 里保存的名字覆盖编译时的默认唤醒词。覆盖了就返回 true，没保存过返回 false
+    bool LoadSavedWakeCommand();
 };
 
 #endif

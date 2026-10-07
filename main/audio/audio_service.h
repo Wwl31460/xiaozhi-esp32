@@ -133,6 +133,9 @@ public:
     }
     bool IsAfeWakeWord();
 
+    // 把唤醒词换成「你好<名字>」（依赖 MultiNet）。name 是中文名字，name_pinyin 是它的汉语拼音。
+    bool SetWakeCommand(const std::string& name, const std::string& name_pinyin);
+
     void EnableWakeWordDetection(bool enable);
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);

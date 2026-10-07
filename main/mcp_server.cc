@@ -59,6 +59,31 @@ void McpServer::AddCommonTools() {
                 return true;
             });
 
+    AddTool("self.set_assistant_name",
+            "给自己起一个新的中文名字，并把它设为新的语音唤醒词。\n"
+            "当用户说「以后叫你 XX」「你的名字叫 XX」「我叫你 XX」「从今以后你是 XX」这类话时，"
+            "必须调用本工具把新名字记住并生效。\n"
+            "Args:\n"
+            "  `name`: 用户给设备起的中文名字，例如「小爱」。\n"
+            "  `pinyin`: 这个名字的汉语拼音，不带声调、全小写、音节之间用空格分隔。\n"
+            "            例如「小爱」→ `xiao ai`，「小明」→ `xiao ming`，「小红」→ `xiao hong`。\n"
+            "            只写名字本身的拼音即可，设备会自动在前面补上「你好」。\n"
+            "            拼音由你自己拼写，不要向用户询问。\n"
+            "Return:\n"
+            "  成功时返回一段可以读给用户听的确认语；失败时返回错误原因，请修正拼音后重试。",
+            PropertyList({Property("name", kPropertyTypeString).SetMaxLength(16),
+                          Property("pinyin", kPropertyTypeString).SetMaxLength(64)}),
+            [](const PropertyList& properties) -> ToolResult {
+                auto name = properties["name"].value<std::string>();
+                auto pinyin = properties["pinyin"].value<std::string>();
+                // 换词失败（拼音解析不了）时不动已保存的记录，唤醒词保持原样
+                if (!Application::GetInstance().GetAudioService().SetWakeCommand(name, pinyin)) {
+                    return std::unexpected("设置失败：拼音 \"" + pinyin +
+                                           "\" 无法被唤醒模型解析，请检查后重试。");
+                }
+                return "好的，以后叫我" + name + "。下次说「你好" + name + "」就能唤醒我。";
+            });
+
     auto backlight = board.GetBacklight();
     if (backlight) {
         AddTool("self.screen.set_brightness", "Set the brightness of the screen.",

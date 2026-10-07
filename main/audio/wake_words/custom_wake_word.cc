@@ -2,14 +2,51 @@
 #include "audio_service.h"
 #include "system_info.h"
 #include "assets.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
 #include <esp_mn_speech_commands.h>
 #include <cJSON.h>
+#include <cctype>
 
 #define TAG "CustomWakeWord"
+
+// 自定义唤醒词在 NVS 中的存放位置（命名空间长度不能超过 15 个字符）
+static constexpr const char* kNvsNamespace = "wake_word";
+static constexpr const char* kNvsPinyinKey = "pinyin";
+static constexpr const char* kNvsDisplayKey = "display";
+
+// 归一化拼音：统一小写、去掉首尾空白、中间连续空白压成一个空格。
+// MultiNet 的中文命令词只认小写、空格分隔的音节，拼音又是大模型现拼的，所以必须先规整。
+static std::string NormalizePinyin(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool space_pending = false;
+    for (char ch : text) {
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            space_pending = !out.empty();
+            continue;
+        }
+        if (space_pending) {
+            out.push_back(' ');
+            space_pending = false;
+        }
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return out;
+}
+
+// 唤醒词统一是「你好<名字>」。大模型可能只给名字的拼音，也可能把「你好」一起给了，
+// 两种都接受，这里保证最终一定带开头，免得用户得光喊名字才能唤醒。
+static std::string BuildWakePinyin(const std::string& name_pinyin) {
+    std::string pinyin = NormalizePinyin(name_pinyin);
+    if (pinyin == "ni hao" || pinyin.rfind("ni hao ", 0) == 0) {
+        return pinyin;
+    }
+    return "ni hao " + pinyin;
+}
 
 CustomWakeWord::CustomWakeWord()
     : wake_word_opus_() {
@@ -120,18 +157,95 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
     input_buffer_.reserve(multinet_->get_samp_chunksize(multinet_model_data_));
-    esp_mn_commands_clear();
-    for (int i = 0; i < commands_.size(); i++) {
-        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+    // 用户改过名字的话，用 NVS 里保存的记录覆盖编译时的默认唤醒词
+    std::deque<Command> builtin_commands = commands_;
+    bool using_saved = LoadSavedWakeCommand();
+    if (!SubmitCommands() && using_saved) {
+        // 保存的拼音解析不了，退回编译时的默认唤醒词，保证设备还能被唤醒
+        ESP_LOGW(TAG, "Saved wake word is unusable, falling back to the built-in one");
+        commands_ = builtin_commands;
+        SubmitCommands();
     }
-    esp_mn_commands_update();
-    
+
     multinet_->print_active_speech_commands(multinet_model_data_);
 #if CONFIG_SEND_WAKE_WORD_DATA
     if (!wake_word_audio_cache_.Initialize(16000 * 2)) {
         ESP_LOGW(TAG, "Wake-word audio upload disabled: PSRAM cache allocation failed");
     }
 #endif
+    return true;
+}
+
+bool CustomWakeWord::SubmitCommandsLocked() {
+    if (commands_.empty()) {
+        ESP_LOGW(TAG, "No wake command to register");
+    }
+    esp_mn_commands_clear();
+    for (size_t i = 0; i < commands_.size(); i++) {
+        esp_mn_commands_add(static_cast<int>(i) + 1, commands_[i].command.c_str());
+    }
+    esp_mn_error_t* err = esp_mn_commands_update();
+    if (err != nullptr) {
+        // 有词条没过 MultiNet 的解析，基本都是拼音格式不对
+        for (int i = 0; i < err->num; i++) {
+            ESP_LOGE(TAG, "MultiNet cannot parse command: \"%s\"", err->phrases[i]->string);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool CustomWakeWord::SubmitCommands() {
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    return SubmitCommandsLocked();
+}
+
+bool CustomWakeWord::LoadSavedWakeCommand() {
+    Settings settings(kNvsNamespace);
+    std::string pinyin = settings.GetString(kNvsPinyinKey);
+    if (pinyin.empty()) {
+        return false;  // 没保存过，沿用编译时的默认唤醒词
+    }
+    std::string display = settings.GetString(kNvsDisplayKey);
+    commands_.clear();
+    commands_.push_back({pinyin, display.empty() ? pinyin : display, "wake"});
+    ESP_LOGI(TAG, "Loaded wake word from NVS: %s (%s)", pinyin.c_str(), display.c_str());
+    return true;
+}
+
+bool CustomWakeWord::SetWakeCommand(const std::string& name, const std::string& name_pinyin) {
+    if (multinet_model_data_ == nullptr || name.empty() || name_pinyin.empty()) {
+        ESP_LOGE(TAG, "SetWakeCommand failed: multinet not ready or empty argument");
+        return false;
+    }
+
+    std::string pinyin = BuildWakePinyin(name_pinyin);
+    std::string display = "你好" + name;
+
+    // 和 FeedSamples() 抢同一份多模型状态，必须串行化
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+
+    // 先备份旧命令词，新词解析失败就回滚，避免唤醒功能直接失效
+    std::deque<Command> backup = commands_;
+    commands_.clear();
+    commands_.push_back({pinyin, display, "wake"});
+
+    if (!SubmitCommandsLocked()) {
+        ESP_LOGE(TAG, "Wake word \"%s\" rejected, rolling back", pinyin.c_str());
+        commands_ = backup;
+        SubmitCommandsLocked();
+        return false;
+    }
+
+    input_buffer_.clear();                   // 丢掉换词前残留的音频
+    multinet_->clean(multinet_model_data_);  // 重置识别状态，让新词立即生效
+
+    // 存到 NVS，下次开机 LoadSavedWakeCommand() 会把它读回来
+    Settings settings(kNvsNamespace, true);
+    settings.SetString(kNvsPinyinKey, pinyin);
+    settings.SetString(kNvsDisplayKey, display);
+
+    ESP_LOGI(TAG, "Wake word changed to: %s (%s)", pinyin.c_str(), display.c_str());
     return true;
 }
 
@@ -191,7 +305,13 @@ void CustomWakeWord::FeedSamples(const int16_t* data, size_t samples, bool mono)
             for (int i = 0; i < mn_result->num && running_; i++) {
                 ESP_LOGI(TAG, "Custom wake word detected: command_id=%d, string=%s, prob=%f", 
                         mn_result->command_id[i], mn_result->string, mn_result->prob[i]);
-                auto& command = commands_[mn_result->command_id[i] - 1];
+                int index = mn_result->command_id[i] - 1;
+                // command_id 是 1 起算的，换词瞬间可能拿到旧表里的 id，这里挡一下越界
+                if (index < 0 || index >= static_cast<int>(commands_.size())) {
+                    ESP_LOGW(TAG, "Ignoring unknown command_id %d", mn_result->command_id[i]);
+                    continue;
+                }
+                auto& command = commands_[index];
                 if (command.action == "wake") {
                     last_detected_wake_word_ = command.text;
                     running_ = false;

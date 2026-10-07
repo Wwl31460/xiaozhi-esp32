@@ -37,6 +37,7 @@ public:
     bool IsVoiceProcessingEnabled() const override;
     bool IsAfeWakeWord() const override { return HasWakeWord(); }
     size_t GetFeedSize() const override;
+    bool SetWakeCommand(const std::string& name, const std::string& name_pinyin) override;
 
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) override;
     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;

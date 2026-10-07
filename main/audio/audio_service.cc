@@ -864,6 +864,11 @@ bool AudioService::IsAfeWakeWord() {
     return audio_engine_initialized_ && audio_engine_->IsAfeWakeWord();
 }
 
+bool AudioService::SetWakeCommand(const std::string& name, const std::string& name_pinyin) {
+    return audio_engine_initialized_ && audio_engine_ &&
+           audio_engine_->SetWakeCommand(name, name_pinyin);
+}
+
 bool AudioService::InitializeAudioEngine() {
     if (!audio_engine_) {
         return false;

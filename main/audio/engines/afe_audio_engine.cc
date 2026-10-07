@@ -324,6 +324,15 @@ size_t AfeAudioEngine::GetFeedSize() const {
     return afe_data_ == nullptr ? frame_samples_ : afe_iface_->get_feed_chunksize(afe_data_);
 }
 
+bool AfeAudioEngine::SetWakeCommand(const std::string& name, const std::string& name_pinyin) {
+    // 只有 MultiNet 支持运行时改词；WakeNet 的唤醒词烧在模型里，改不了
+    if (wake_detector_ != WakeDetector::kMultiNet || !custom_wake_word_) {
+        ESP_LOGW(TAG, "Current wake detector does not support changing the wake word");
+        return false;
+    }
+    return custom_wake_word_->SetWakeCommand(name, name_pinyin);
+}
+
 void AfeAudioEngine::OnWakeWordDetected(
     std::function<void(const std::string& wake_word)> callback) {
     wake_word_detected_callback_ = std::move(callback);
